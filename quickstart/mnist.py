@@ -1,100 +1,135 @@
-# This is an updated version of keras/mnist.py from the spellrun/examples repository.
-
-import tensorflow as tf
-import idx2numpy
-import keras
+from __future__ import print_function
 import argparse
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torchvision import datasets, transforms
+from torch.optim.lr_scheduler import StepLR
 
-from keras.models import Sequential
-from keras.datasets import mnist
-from keras.layers import Conv2D, Dense, MaxPooling2D, Activation, Flatten, Dropout
+
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, 3, 1)
+        self.conv2 = nn.Conv2d(32, 64, 3, 1)
+        self.dropout1 = nn.Dropout2d(0.25)
+        self.dropout2 = nn.Dropout2d(0.5)
+        self.fc1 = nn.Linear(9216, 128)
+        self.fc2 = nn.Linear(128, 10)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = F.relu(x)
+        x = self.conv2(x)
+        x = F.relu(x)
+        x = F.max_pool2d(x, 2)
+        x = self.dropout1(x)
+        x = torch.flatten(x, 1)
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.dropout2(x)
+        x = self.fc2(x)
+        output = F.log_softmax(x, dim=1)
+        return output
 
 
-parser = argparse.ArgumentParser()
+def train(args, model, device, train_loader, optimizer, epoch):
+    model.train()
+    for batch_idx, (data, target) in enumerate(train_loader):
+        data, target = data.to(device), target.to(device)
+        optimizer.zero_grad()
+        output = model(data)
+        loss = F.nll_loss(output, target)
+        loss.backward()
+        optimizer.step()
+        if batch_idx % args.log_interval == 0:
+            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+                epoch, batch_idx * len(data), len(train_loader.dataset),
+                100. * batch_idx / len(train_loader), loss.item()))
+            if args.dry_run:
+                break
 
-parser.add_argument('--batch-size', type=int,
-                    dest='batch_size', help='minibatch size',
-                    default=128)
-parser.add_argument('--epochs', type=int,
-                    dest='epochs', help='epochs to train for',
-                    default=10)
 
-parser.add_argument('--conv1-filters', type=int,
-                    dest='c1_filters', help='number of convolution filters in the first convolutional layer',
-                    default=20)
-parser.add_argument('--conv1-size', type=int,
-                    dest='c1_size', help='convolutional 1 filter size (will be N x N)',
-                    default=3)
+def test(model, device, test_loader):
+    model.eval()
+    test_loss = 0
+    correct = 0
+    with torch.no_grad():
+        for data, target in test_loader:
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            test_loss += F.nll_loss(output, target, reduction='sum').item()  # sum up batch loss
+            pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
+            correct += pred.eq(target.view_as(pred)).sum().item()
 
-parser.add_argument('--conv2-filters', type=int,
-                    dest='c2_filters', help='number of convolution filters in the second convolutional layer',
-                    default=50)
-parser.add_argument('--conv2-size', type=int,
-                    dest='c2_size', help='convolutional 2 filter size (will be N x N)',
-                    default=3)
+    test_loss /= len(test_loader.dataset)
 
-parser.add_argument('--conv3-filters', type=int,
-                    dest='c3_filters', help='number of convolution filters in the second convolutional layer',
-                    default=50)
-parser.add_argument('--conv3-size', type=int,
-                    dest='c3_size', help='convolutional 2 filter size (will be N x N)',
-                    default=3)
+    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
+        test_loss, correct, len(test_loader.dataset),
+        100. * correct / len(test_loader.dataset)))
 
-parser.add_argument('--dense-size', type=int,
-                    dest='f1_filters', help='size of fully connected layer',
-                    default=128)
 
-parser.add_argument('--dropout', type=float,
-                    dest='dropout', help='dropout rate',
-                    default=.25)
+def main():
+    # Training settings
+    parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
+    parser.add_argument('--batch-size', type=int, default=64, metavar='N',
+                        help='input batch size for training (default: 64)')
+    parser.add_argument('--test-batch-size', type=int, default=1000, metavar='N',
+                        help='input batch size for testing (default: 1000)')
+    parser.add_argument('--epochs', type=int, default=14, metavar='N',
+                        help='number of epochs to train (default: 14)')
+    parser.add_argument('--lr', type=float, default=1.0, metavar='LR',
+                        help='learning rate (default: 1.0)')
+    parser.add_argument('--gamma', type=float, default=0.7, metavar='M',
+                        help='Learning rate step gamma (default: 0.7)')
+    parser.add_argument('--no-cuda', action='store_true', default=False,
+                        help='disables CUDA training')
+    parser.add_argument('--dry-run', action='store_true', default=False,
+                        help='quickly check a single pass')
+    parser.add_argument('--seed', type=int, default=1, metavar='S',
+                        help='random seed (default: 1)')
+    parser.add_argument('--log-interval', type=int, default=10, metavar='N',
+                        help='how many batches to wait before logging training status')
+    parser.add_argument('--save-model', action='store_true', default=False,
+                        help='For Saving the current Model')
+    args = parser.parse_args()
+    use_cuda = not args.no_cuda and torch.cuda.is_available()
 
-args = parser.parse_args()
+    torch.manual_seed(args.seed)
 
-x = idx2numpy.convert_from_file('/mnt/mnist/train-images-idx3-ubyte')
-y = idx2numpy.convert_from_file('/mnt/mnist/train-labels-idx1-ubyte')
+    device = torch.device("cuda" if use_cuda else "cpu")
 
-t_x = idx2numpy.convert_from_file('/mnt/mnist/t10k-images-idx3-ubyte')
-t_y = idx2numpy.convert_from_file('/mnt/mnist/t10k-labels-idx1-ubyte')
+    kwargs = {'batch_size': args.batch_size}
+    if use_cuda:
+        kwargs.update({'num_workers': 1,
+                       'pin_memory': True,
+                       'shuffle': True},
+                     )
 
-classes = 10
+    transform=transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+        ])
+    dataset1 = datasets.MNIST('../data', train=True, download=True,
+                       transform=transform)
+    dataset2 = datasets.MNIST('../data', train=False,
+                       transform=transform)
+    train_loader = torch.utils.data.DataLoader(dataset1,**kwargs)
+    test_loader = torch.utils.data.DataLoader(dataset2, **kwargs)
 
-x = x.reshape(x.shape[0], x.shape[1], x.shape[2], 1).astype('float32') / 255
-t_x = t_x.reshape(t_x.shape[0], t_x.shape[1], t_x.shape[2], 1).astype('float32') / 255
+    model = Net().to(device)
+    optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
 
-y = keras.utils.to_categorical(y, classes)
-t_y = keras.utils.to_categorical(t_y, classes)
+    scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
+    for epoch in range(1, args.epochs + 1):
+        train(args, model, device, train_loader, optimizer, epoch)
+        test(model, device, test_loader)
+        scheduler.step()
 
-model = Sequential()
-model.add(Conv2D(args.c1_filters, (args.c1_size, args.c1_size), padding="same", activation="relu", input_shape=(x.shape[1], x.shape[2], 1)))
-model.add(MaxPooling2D(pool_size=(2,2), strides=(2,2)))
-model.add(Conv2D(args.c2_filters, (args.c2_size, args.c2_size), padding="same", activation="relu"))
-model.add(MaxPooling2D(pool_size=(2,2), strides=(2,2)))
-model.add(Conv2D(args.c3_filters, (args.c3_size, args.c3_size), padding="same", activation="relu"))
-model.add(MaxPooling2D(pool_size=(2,2), strides=(2,2)))
-model.add(Flatten())
-model.add(Dense(args.f1_filters, activation="relu"))
-model.add(Dropout(args.dropout))
-model.add(Dense(classes, activation="softmax"))
+    if args.save_model:
+        torch.save(model.state_dict(), "mnist_cnn.pt")
 
-model.compile(loss=keras.losses.categorical_crossentropy,
-              optimizer=keras.optimizers.Adadelta(),
-              metrics=['accuracy'])
 
-model.fit(x, y,
-		  batch_size=args.batch_size,
-		  epochs=args.epochs,
-          verbose=1,
-          validation_data=(t_x, t_y))
-
-score = model.evaluate(t_x, t_y, verbose=0)
-
-print('Test loss:', score[0])
-print('Test accuracy:', score[1])
-
-if score[1] < .98:
-     print("Accuracy below threshold (.98), test failed. Exiting with nonzero status.")
-     exit(2)
-else:
-     print("Accuracy above threshold (.98), test succeeded.")
-     model.save_weights("model.h5")
-     exit(0)
+if __name__ == '__main__':
+    main()
